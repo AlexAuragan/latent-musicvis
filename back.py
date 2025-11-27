@@ -158,6 +158,8 @@ def decode_latents(latents: torch.Tensor) -> torch.Tensor:
 
 def decode_latents_mock(latents: torch.Tensor) -> torch.Tensor:
     """Mock decoding when VAE not available"""
+    latents = latents.to(device)
+
     batch, dim, num_latents = latents.shape
     samples = num_latents * SAMPLES_PER_LATENT
 
