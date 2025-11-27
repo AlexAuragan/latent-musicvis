@@ -30,6 +30,43 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_CACHE_ENTRIES = 10
 
 
+def find_best_offset(waveform: torch.Tensor, max_offset: int = SAMPLES_PER_LATENT) -> int:
+    """
+    waveform: [2, samples]
+    returns best integer offset in [0, max_offset)
+    """
+    if waveform.dim() == 2:
+        waveform = waveform.unsqueeze(0)  # [1, 2, samples]
+
+    batch, channels, total_samples = waveform.shape
+    best_score = float("inf")
+    best_offset = 0
+    edge = 32  # how many samples from each side of the boundary to compare
+
+    for offset in range(max_offset):
+        usable = total_samples - offset
+        if usable <= SAMPLES_PER_LATENT * 2:
+            break  # not enough data to evaluate
+
+        num_frames = usable // SAMPLES_PER_LATENT
+        end = offset + num_frames * SAMPLES_PER_LATENT
+
+        # [1, 2, num_frames, frame_len]
+        frames = waveform[:, :, offset:end].view(batch, channels, num_frames, SAMPLES_PER_LATENT)
+
+        # Compare last edge samples of frame n with first edge samples of frame n+1
+        left = frames[:, :, :-1, -edge:]
+        right = frames[:, :, 1:, :edge]
+
+        diff = left - right
+        score = diff.pow(2).mean().item()  # lower = smoother boundaries
+
+        if score < best_score:
+            best_score = score
+            best_offset = offset
+
+    return best_offset
+
 def load_vae():
     """Load the VAE model from configured paths"""
     global vae

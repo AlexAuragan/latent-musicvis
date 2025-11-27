@@ -201,12 +201,29 @@
 <body>
   <div id="app">
     <div class="header">
-      <h1>Latent Space Explorer</h1>
         <label class="upload-btn" id="upload-btn">
           <span id="upload-label-text">Upload Audio</span>
           <input type="file" id="file-input" accept="audio/*">
         </label>
-      <button class="upload-btn" id="play-btn" style="background:#22c55e;display:none">▶ Play</button>
+
+        <button class="upload-btn" id="youtube-toggle-btn" style="background:#ec4899;">
+          YouTube URL
+        </button>
+
+        <div id="youtube-form" style="display:none;align-items:center;gap:6px;">
+          <input
+            type="text"
+            id="youtube-url-input"
+            placeholder="https://youtu.be/..."
+            style="font-size:12px;padding:6px 8px;border-radius:6px;border:1px solid #27272f;background:#050509;color:#e5e5f0;min-width:220px;"
+          >
+          <button class="upload-btn" id="youtube-submit-btn" style="background:#ec4899;">
+            Fetch
+          </button>
+        </div>
+
+        <button class="upload-btn" id="play-btn" style="background:#22c55e;display:none">▶ Play</button>
+
       <button class="upload-btn" id="line-toggle" style="background:#6366f1;display:none">🌈 Line</button>
       <label class="upload-btn" id="resynth-btn" style="background:#f59e0b;display:none">
         🔀 Resynth
@@ -311,6 +328,68 @@
     const footerText = document.getElementById('footer-text');
     const playBtn = document.getElementById('play-btn');
     const lineToggle = document.getElementById('line-toggle');
+    async function handleEncodeStream(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = JSON.parse(line.slice(6));
+
+          if (data.stage === 'cached') {
+            statusEl.textContent = 'Loading from cache...';
+          } else if (data.stage === 'loading_vae') {
+            statusEl.textContent = 'Loading VAE...';
+          } else if (data.stage === 'encoding') {
+            statusEl.textContent = 'Encoding audio...';
+          } else if (data.stage === 'unloading_vae') {
+            statusEl.textContent = 'Freeing VRAM...';
+          } else if (data.stage === 'umap') {
+            statusEl.textContent = `Running UMAP on ${data.num_latents} latents...`;
+            audioInfo = { numLatents: data.num_latents, samplesPerLatent: 2048 };
+            projection = Array.from({ length: data.num_latents }, () => [
+              (Math.random() - 0.5) * 2,
+              (Math.random() - 0.5) * 2,
+              (Math.random() - 0.5) * 2
+            ]);
+            initThreeJS();
+          } else if (data.stage === 'done') {
+            latents = data.latents;
+            audioInfo = {
+              duration: data.duration_seconds,
+              numLatents: data.num_latents,
+              samplesPerLatent: data.samples_per_latent
+            };
+
+            if (!points) {
+              projection = data.projection;
+              initThreeJS();
+              buildClusters();
+            } else {
+              animateToProjection(data.projection);
+            }
+
+            statusEl.textContent = `${data.num_latents} latents • ${data.duration_seconds.toFixed(1)}s • Click to play`;
+            footerText.textContent = `${data.num_latents} points`;
+            playBtn.style.display = 'inline-block';
+            lineToggle.style.display = 'inline-block';
+            document.getElementById('cluster-control').style.display = 'flex';
+            document.getElementById('resynth-btn').style.display = 'inline-block';
+          } else if (data.stage === 'error') {
+            throw new Error(data.error);
+          }
+        }
+      }
+    }
 
     // Check server
     async function checkServer() {
@@ -326,87 +405,67 @@
     }
 
     const uploadLabelText = document.getElementById('upload-label-text');
+    const youtubeToggleBtn = document.getElementById('youtube-toggle-btn');
+    const youtubeForm = document.getElementById('youtube-form');
+    const youtubeUrlInput = document.getElementById('youtube-url-input');
+    const youtubeSubmitBtn = document.getElementById('youtube-submit-btn');
+    async function processYouTubeUrl(url) {
+      uploadBtn.style.pointerEvents = 'none';
+      youtubeToggleBtn.style.pointerEvents = 'none';
+      youtubeSubmitBtn.disabled = true;
+      youtubeSubmitBtn.textContent = 'Fetching...';
+      statusEl.textContent = 'Downloading from YouTube...';
+
+      if (isFullPlaying) stopFullPlayback();
+      playbackAudio = null;
+
+      try {
+        const response = await fetch(`${API_URL}/encode_youtube`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || 'YouTube fetch failed');
+        }
+
+        await handleEncodeStream(response);
+
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = `YouTube error: ${err.message}`;
+      } finally {
+        uploadBtn.style.pointerEvents = 'auto';
+        youtubeToggleBtn.style.pointerEvents = 'auto';
+        youtubeSubmitBtn.disabled = false;
+        youtubeSubmitBtn.textContent = 'Fetch';
+      }
+    }
+
     // Process uploaded file with streaming UMAP
     async function processFile(file) {
       uploadLabelText.textContent = 'Processing...';
       uploadBtn.style.pointerEvents = 'none';
       statusEl.textContent = `Uploading ${file.name}...`;
-      
+
       if (isFullPlaying) stopFullPlayback();
       playbackAudio = null;
-      
+
       try {
         const formData = new FormData();
         formData.append('file', file);
-        
+
         const response = await fetch(`${API_URL}/encode_stream`, {
           method: 'POST',
           body: formData
         });
-        
+
         if (!response.ok) throw new Error(await response.text());
-        
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n\n');
-          buffer = lines.pop() || '';
-          
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            const data = JSON.parse(line.slice(6));
-            
-            if (data.stage === 'cached') {
-              statusEl.textContent = 'Loading from cache...';
-            } else if (data.stage === 'loading_vae') {
-              statusEl.textContent = 'Loading VAE...';
-            } else if (data.stage === 'encoding') {
-              statusEl.textContent = 'Encoding audio...';
-            } else if (data.stage === 'unloading_vae') {
-              statusEl.textContent = 'Freeing VRAM...';
-            } else if (data.stage === 'umap') {
-              statusEl.textContent = `Running UMAP on ${data.num_latents} latents...`;
-              audioInfo = { numLatents: data.num_latents, samplesPerLatent: 2048 };
-              projection = Array.from({ length: data.num_latents }, () => [
-                (Math.random() - 0.5) * 2,
-                (Math.random() - 0.5) * 2,
-                (Math.random() - 0.5) * 2
-              ]);
-              initThreeJS();
-            } else if (data.stage === 'done') {
-              latents = data.latents;
-              audioInfo = {
-                duration: data.duration_seconds,
-                numLatents: data.num_latents,
-                samplesPerLatent: data.samples_per_latent
-              };
-              
-              if (!points) {
-                projection = data.projection;
-                initThreeJS();
-                buildClusters();
-              } else {
-                animateToProjection(data.projection);
-              }
-              
-              statusEl.textContent = `${data.num_latents} latents • ${data.duration_seconds.toFixed(1)}s • Click to play`;
-              footerText.textContent = `${data.num_latents} points`;
-              playBtn.style.display = 'inline-block';
-              lineToggle.style.display = 'inline-block';
-              document.getElementById('cluster-control').style.display = 'flex';
-              document.getElementById('resynth-btn').style.display = 'inline-block';
-            } else if (data.stage === 'error') {
-              throw new Error(data.error);
-            }
-          }
-        }
-        
+
+        await handleEncodeStream(response);
+
       } catch (err) {
         statusEl.textContent = `Error: ${err.message}`;
       } finally {
@@ -414,7 +473,37 @@
         uploadBtn.style.pointerEvents = 'auto';
       }
     }
-    
+
+    youtubeToggleBtn.addEventListener('click', () => {
+      const isVisible = youtubeForm.style.display === 'flex';
+      youtubeForm.style.display = isVisible ? 'none' : 'flex';
+      if (!isVisible) {
+        youtubeUrlInput.focus();
+      }
+    });
+
+    youtubeSubmitBtn.addEventListener('click', () => {
+      const url = youtubeUrlInput.value.trim();
+      if (!url) {
+        statusEl.textContent = 'Please paste a YouTube URL';
+        return;
+      }
+      processYouTubeUrl(url);
+    });
+
+    youtubeUrlInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const url = youtubeUrlInput.value.trim();
+        if (!url) {
+          statusEl.textContent = 'Please paste a YouTube URL';
+          return;
+        }
+        processYouTubeUrl(url);
+      }
+    });
+
+
     // Animate from current positions to target projection
     let animationId = null;
     function animateToProjection(targetProjection) {

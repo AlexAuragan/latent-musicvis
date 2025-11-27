@@ -10,6 +10,8 @@ Environment Variables:
 
 from contextlib import asynccontextmanager
 import os
+from pathlib import Path
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, RedirectResponse
@@ -24,8 +26,10 @@ import hashlib
 from typing import Optional, Dict
 import umap
 import tempfile
+import yt_dlp
+
 from back import vae, device, VAE_CONFIG_PATH, VAE_CKPT_PATH, SAMPLE_RATE, load_vae, encode_audio_chunked, unload_vae, \
-    MAX_CACHE_ENTRIES, SAMPLES_PER_LATENT, decode_audio_chunked
+    MAX_CACHE_ENTRIES, SAMPLES_PER_LATENT, decode_audio_chunked, find_best_offset
 
 # Store original waveform for playback
 current_waveform: Optional[torch.Tensor] = None
@@ -34,6 +38,9 @@ current_waveform: Optional[torch.Tensor] = None
 latent_cache: Dict[str, tuple] = {}
 
 PORT = int(os.environ.get("PORT", "8420"))
+
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
 @asynccontextmanager
 async def startup(app: FastAPI):
@@ -75,107 +82,8 @@ async def encode_stream_endpoint(file: UploadFile = File(...)):
     global current_latents, current_projection, current_waveform, vae, latent_cache
 
     content = await file.read()
-    file_hash = hashlib.md5(content).hexdigest()
+    return StreamingResponse(encode_from_bytes(content), media_type="text/event-stream")
 
-    async def generate():
-        global current_latents, current_projection, current_waveform, vae, latent_cache
-
-        try:
-            # Check cache
-            if file_hash in latent_cache:
-                print(f"Cache hit for {file_hash[:8]}...")
-                cached = latent_cache[file_hash]
-                latents_np, projection_normalized, waveform, duration = cached
-
-                current_latents = latents_np
-                current_projection = projection_normalized
-                current_waveform = waveform
-
-                yield f"data: {json.dumps({'stage': 'cached'})}\n\n"
-                yield f"data: {json.dumps({'stage': 'done', 'projection': projection_normalized.tolist(), 'latents': latents_np.tolist(), 'duration_seconds': duration, 'samples_per_latent': SAMPLES_PER_LATENT, 'num_latents': int(latents_np.shape[0])})}\n\n"
-                return
-
-            # Load audio
-            audio_buffer = io.BytesIO(content)
-            waveform, sr = torchaudio.load(audio_buffer)
-
-            if sr != SAMPLE_RATE:
-                resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
-                waveform = resampler(waveform)
-
-            if waveform.shape[0] == 1:
-                waveform = torch.cat([waveform, waveform], dim=0)
-            elif waveform.shape[0] > 2:
-                waveform = waveform[:2]
-
-            waveform = waveform / (waveform.abs().max() + 1e-6)
-            current_waveform = waveform
-
-            yield f"data: {json.dumps({'stage': 'loading_vae'})}\n\n"
-
-            if vae is None:
-                load_vae()
-
-            yield f"data: {json.dumps({'stage': 'encoding'})}\n\n"
-
-            latents = encode_audio_chunked(waveform, chunk_seconds=10.0)
-            latents_np = latents[0].cpu().numpy().T
-            current_latents = latents_np
-
-            print(
-                f"Encoded {waveform.shape[1]} samples -> {latents_np.shape[0]} latents"
-            )
-
-            yield f"data: {json.dumps({'stage': 'unloading_vae'})}\n\n"
-            unload_vae()
-
-            yield f"data: {json.dumps({'stage': 'umap', 'num_latents': int(latents_np.shape[0])})}\n\n"
-
-            # UMAP
-            if latents_np.shape[0] < 5:
-                projection = latents_np[:, :3]
-            else:
-                n_pts = latents_np.shape[0]
-                reducer = umap.UMAP(
-                    n_components=3,
-                    n_neighbors=min(50, n_pts - 1),
-                    min_dist=0.3,
-                    n_epochs=1000,
-                    metric="euclidean",
-                    spread=1.0,
-                    random_state=42,
-                )
-                projection = reducer.fit_transform(latents_np)
-
-            # Normalize projection
-            proj_mean = projection.mean(axis=0)
-            proj_centered = projection - proj_mean
-            proj_max = np.abs(proj_centered).max(axis=0) + 1e-6  # per-dimension max
-            projection_normalized = proj_centered / proj_max
-
-            current_projection = projection_normalized
-
-            # Cache
-            duration = float(waveform.shape[1] / SAMPLE_RATE)
-            if len(latent_cache) >= MAX_CACHE_ENTRIES:
-                oldest_key = next(iter(latent_cache))
-                del latent_cache[oldest_key]
-            latent_cache[file_hash] = (
-                latents_np,
-                projection_normalized,
-                waveform,
-                duration,
-            )
-
-            yield f"data: {json.dumps({'stage': 'done', 'projection': projection_normalized.tolist(), 'latents': latents_np.tolist(), 'duration_seconds': duration, 'samples_per_latent': SAMPLES_PER_LATENT, 'num_latents': int(latents_np.shape[0])})}\n\n"
-
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            yield f"data: {json.dumps({'stage': 'error', 'error': str(e)})}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.get("/audio_full")
@@ -220,6 +128,135 @@ async def play_endpoint(request: PlayRequest):
 
     return Response(content=data, media_type="audio/wav")
 
+async def encode_from_bytes(content: bytes):
+    """Shared SSE encoder: takes raw audio bytes, streams progress."""
+    global current_latents, current_projection, current_waveform, vae, latent_cache
+
+    file_hash = hashlib.md5(content).hexdigest()
+
+    try:
+        # Check cache
+        if file_hash in latent_cache:
+            print(f"Cache hit for {file_hash[:8]}...")
+            cached = latent_cache[file_hash]
+            latents_np, projection_normalized, waveform, duration = cached
+
+            current_latents = latents_np
+            current_projection = projection_normalized
+            current_waveform = waveform
+
+            yield f"data: {json.dumps({'stage': 'cached'})}\n\n"
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "stage": "done",
+                        "projection": projection_normalized.tolist(),
+                        "latents": latents_np.tolist(),
+                        "duration_seconds": duration,
+                        "samples_per_latent": SAMPLES_PER_LATENT,
+                        "num_latents": int(latents_np.shape[0]),
+                    }
+                )
+                + "\n\n"
+            )
+            return
+
+        # Load audio
+        audio_buffer = io.BytesIO(content)
+        waveform, sr = torchaudio.load(audio_buffer)
+
+        if sr != SAMPLE_RATE:
+            resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
+            waveform = resampler(waveform)
+
+        if waveform.shape[0] == 1:
+            waveform = torch.cat([waveform, waveform], dim=0)
+        elif waveform.shape[0] > 2:
+            waveform = waveform[:2]
+
+        waveform = waveform / (waveform.abs().max() + 1e-6)
+        current_waveform = waveform
+
+        yield f"data: {json.dumps({'stage': 'loading_vae'})}\n\n"
+
+        if vae is None:
+            load_vae()
+
+        yield f"data: {json.dumps({'stage': 'encoding'})}\n\n"
+
+        print("finding")
+        offset = find_best_offset(waveform)
+
+        padded_waveform = torch.nn.functional.pad(waveform, (offset, 0))
+        latents = encode_audio_chunked(padded_waveform, chunk_seconds=10.0)
+        latents_np = latents[0].cpu().numpy().T
+        current_latents = latents_np
+
+        print(f"Encoded {waveform.shape[1]} samples -> {latents_np.shape[0]} latents")
+
+        yield f"data: {json.dumps({'stage': 'unloading_vae'})}\n\n"
+        unload_vae()
+
+        yield f"data: {json.dumps({'stage': 'umap', 'num_latents': int(latents_np.shape[0])})}\n\n"
+
+        # UMAP
+        if latents_np.shape[0] < 5:
+            projection = latents_np[:, :3]
+        else:
+            n_pts = latents_np.shape[0]
+            reducer = umap.UMAP(
+                n_components=3,
+                n_neighbors=min(50, n_pts - 1),
+                min_dist=0.3,
+                n_epochs=1000,
+                metric="euclidean",
+                spread=1.0,
+                random_state=42,
+            )
+            projection = reducer.fit_transform(latents_np)
+
+        # Normalize projection
+        proj_mean = projection.mean(axis=0)
+        proj_centered = projection - proj_mean
+        proj_max = np.abs(proj_centered).max(axis=0) + 1e-6  # per-dimension max
+        projection_normalized = proj_centered / proj_max
+
+        current_projection = projection_normalized
+
+        # Cache
+        duration = float(waveform.shape[1] / SAMPLE_RATE)
+        if len(latent_cache) >= MAX_CACHE_ENTRIES:
+            oldest_key = next(iter(latent_cache))
+            del latent_cache[oldest_key]
+        latent_cache[file_hash] = (
+            latents_np,
+            projection_normalized,
+            waveform,
+            duration,
+        )
+
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "stage": "done",
+                    "projection": projection_normalized.tolist(),
+                    "latents": latents_np.tolist(),
+                    "duration_seconds": duration,
+                    "samples_per_latent": SAMPLES_PER_LATENT,
+                    "num_latents": int(latents_np.shape[0]),
+                }
+            )
+            + "\n\n"
+        )
+
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        yield f"data: {json.dumps({'stage': 'error', 'error': str(e)})}\n\n"
+
 
 @app.post("/resynth")
 async def resynth(file: UploadFile = File(...)):
@@ -247,6 +284,7 @@ async def resynth(file: UploadFile = File(...)):
             waveform = waveform.repeat(2, 1)
         elif waveform.shape[0] > 2:
             waveform = waveform[:2]
+        waveform = waveform / (waveform.abs().max() + 1e-6)
 
         print(f"Resynth: encoding target audio {waveform.shape}")
 
@@ -307,6 +345,84 @@ async def health():
         "latents_loaded": current_latents is not None,
         "num_latents": current_latents.shape[0] if current_latents is not None else 0,
     }
+
+class YoutubeRequest(BaseModel):
+    url: str
+
+def download_youtube_audio(url: str) -> Path:
+    """
+    Download audio from YouTube using yt-dlp into CACHE_DIR.
+    Returns the path to the audio file.
+    """
+    if not url.strip():
+        raise HTTPException(status_code=400, detail="Empty URL")
+
+    # Use video ID as cache key when possible
+    # yt-dlp can write the id into filename.
+    output_template = str(CACHE_DIR / "%(id)s.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": False,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+                "preferredquality": "192",
+            }
+        ],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise HTTPException(status_code=400, detail="Failed to download video")
+
+        # When using FFmpegExtractAudio, yt-dlp usually outputs <id>.wav
+        video_id = info.get("id")
+        if not video_id:
+            raise HTTPException(status_code=400, detail="Could not get video ID")
+
+        out_path = CACHE_DIR / f"{video_id}.wav"
+        if not out_path.exists():
+            # Fallback: try whatever filename yt-dlp returned
+            requested_downloads = info.get("requested_downloads") or []
+            for rd in requested_downloads:
+                filename = rd.get("filepath")
+                if filename:
+                    candidate = Path(filename)
+                    if candidate.exists():
+                        out_path = candidate
+                        break
+
+        if not out_path.exists():
+            raise HTTPException(status_code=500, detail="Downloaded file not found")
+
+        return out_path
+
+@app.post("/encode_youtube")
+def encode_youtube(req: YoutubeRequest):
+    """
+    Download audio via yt-dlp and run the same encode/UMAP pipeline
+    as /encode_stream. Returns SSE with identical 'stage' events.
+    """
+    try:
+        audio_path = download_youtube_audio(req.url)
+        content = audio_path.read_bytes()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"YouTube download error: {e}")
+
+    return StreamingResponse(
+        encode_from_bytes(content),
+        media_type="text/event-stream",
+    )
+
 
 
 # Serve static files (explorer.html)
