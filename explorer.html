@@ -202,10 +202,10 @@
   <div id="app">
     <div class="header">
       <h1>Latent Space Explorer</h1>
-      <label class="upload-btn" id="upload-btn">
-        Upload Audio
-        <input type="file" id="file-input" accept="audio/*">
-      </label>
+        <label class="upload-btn" id="upload-btn">
+          <span id="upload-label-text">Upload Audio</span>
+          <input type="file" id="file-input" accept="audio/*">
+        </label>
       <button class="upload-btn" id="play-btn" style="background:#22c55e;display:none">▶ Play</button>
       <button class="upload-btn" id="line-toggle" style="background:#6366f1;display:none">🌈 Line</button>
       <label class="upload-btn" id="resynth-btn" style="background:#f59e0b;display:none">
@@ -325,9 +325,10 @@
       }
     }
 
+    const uploadLabelText = document.getElementById('upload-label-text');
     // Process uploaded file with streaming UMAP
     async function processFile(file) {
-      uploadBtn.textContent = 'Processing...';
+      uploadLabelText.textContent = 'Processing...';
       uploadBtn.style.pointerEvents = 'none';
       statusEl.textContent = `Uploading ${file.name}...`;
       
@@ -409,7 +410,7 @@
       } catch (err) {
         statusEl.textContent = `Error: ${err.message}`;
       } finally {
-        uploadBtn.textContent = 'Upload Audio';
+        uploadLabelText.textContent = 'Upload Audio';
         uploadBtn.style.pointerEvents = 'auto';
       }
     }

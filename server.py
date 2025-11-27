@@ -138,8 +138,8 @@ async def encode_stream_endpoint(file: UploadFile = File(...)):
                 n_pts = latents_np.shape[0]
                 reducer = umap.UMAP(
                     n_components=3,
-                    n_neighbors=min(30, n_pts - 1),
-                    min_dist=0.05,
+                    n_neighbors=min(50, n_pts - 1),
+                    min_dist=0.3,
                     n_epochs=1000,
                     metric="euclidean",
                     spread=1.0,
@@ -147,11 +147,11 @@ async def encode_stream_endpoint(file: UploadFile = File(...)):
                 )
                 projection = reducer.fit_transform(latents_np)
 
-            # Center and scale
-            center = projection.mean(axis=0)
-            projection_centered = projection - center
-            max_abs = np.abs(projection_centered).max() + 1e-6
-            projection_normalized = projection_centered / max_abs
+            # Normalize projection
+            proj_mean = projection.mean(axis=0)
+            proj_centered = projection - proj_mean
+            proj_max = np.abs(proj_centered).max(axis=0) + 1e-6  # per-dimension max
+            projection_normalized = proj_centered / proj_max
 
             current_projection = projection_normalized
 

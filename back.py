@@ -219,5 +219,3 @@ def decode_audio_chunked(
         torch.cuda.empty_cache()
 
     return torch.cat(chunks, dim=2)
-
-print(device)
