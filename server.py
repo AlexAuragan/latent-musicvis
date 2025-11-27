@@ -8,10 +8,11 @@ Environment Variables:
   PORT             - Server port (default: 8420)
 """
 
+from contextlib import asynccontextmanager
 import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import numpy as np
@@ -236,7 +237,16 @@ def decode_audio_chunked(
 
 
 # ============ FASTAPI APP ============
-app = FastAPI(title="Latent Space Explorer API")
+@asynccontextmanager
+async def startup(app: FastAPI):
+    print(f"Server starting on port {PORT}")
+    print(f"VAE config: {VAE_CONFIG_PATH}")
+    print(f"VAE checkpoint: {VAE_CKPT_PATH}")
+    print(f"Device: {device}")
+    yield
+
+
+app = FastAPI(title="Latent Space Explorer API", lifespan=startup)
 
 app.add_middleware(
     CORSMiddleware,
@@ -256,12 +266,9 @@ current_latents: Optional[np.ndarray] = None
 current_projection: Optional[np.ndarray] = None
 
 
-@app.on_event("startup")
-async def startup():
-    print(f"Server starting on port {PORT}")
-    print(f"VAE config: {VAE_CONFIG_PATH}")
-    print(f"VAE checkpoint: {VAE_CKPT_PATH}")
-    print(f"Device: {device}")
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    return RedirectResponse(url="/explorer.html")
 
 
 @app.post("/encode_stream")
