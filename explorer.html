@@ -332,17 +332,15 @@
     </div>
     <div class="footer" id="footer">
       <button class="footer-btn" id="styling-btn">🎨 Styling</button>
-
         <div class="palette-editor" id="palette-editor" style="display:none">
           <span class="palette-label">Theme:</span>
           <input type="color" id="bg-color-input" title="Background" value="#08080c">
+
           <span class="palette-label small">Points:</span>
           <input type="color" id="pt-color-1" value="#6366f1" title="Point color 1">
           <input type="color" id="pt-color-2" value="#ec4899" title="Point color 2">
           <input type="color" id="pt-color-3" value="#f97316" title="Point color 3">
-          <button class="palette-apply-btn" id="palette-apply-btn">Apply</button>
 
-          <!-- NEW: idle alpha + decay controls -->
           <span class="palette-label small" style="margin-left:10px;">Idle α</span>
           <input type="range" id="idle-alpha-slider" min="0" max="100" value="30">
           <span class="palette-label small" id="idle-alpha-value">0.30</span>
@@ -350,7 +348,41 @@
           <span class="palette-label small" style="margin-left:10px;">Tail Length</span>
           <input type="range" id="decay-slider" min="3" max="40" value="8">
           <span class="palette-label small" id="decay-value">8</span>
+
+          <!-- Path idle alpha -->
+          <span class="palette-label small">Path alpha</span>
+          <input
+            type="range"
+            id="path-alpha-slider"
+            min="0"
+            max="100"
+            value="30"
+          />
+          <span id="path-alpha-value">0.30</span>
+
+          <!-- NEW: glow intensity -->
+          <span class="palette-label small" style="margin-left:10px;">Glow</span>
+          <input
+            type="range"
+            id="glow-slider"
+            min="0"
+            max="100"
+            value="100"
+          />
+          <span class="palette-label small" id="glow-value">1.00</span>
+
+          <!-- NEW: glow color -->
+          <span class="palette-label small" style="margin-left:10px;">Glow color</span>
+          <input
+            type="color"
+            id="glow-color-input"
+            value="#ffffff"
+            title="Glow color"
+          >
+
+          <button class="palette-apply-btn" id="palette-apply-btn">Apply</button>
         </div>
+
 
 
       <span class="footer-text" id="footer-text">

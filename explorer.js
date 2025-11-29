@@ -7,6 +7,7 @@ const API_URL = window.location.origin;
 // Idle opacity config (user adjustable)
 let idleAlpha = 0.3;   // starting opacity for idle points (0–1)
 let trailDecay = 8;    // how many points stay in the bright trail
+let pathIdleAlpha = 0.3;
 
 // State
 let latents = [];
@@ -45,6 +46,43 @@ let theme = {
   // default gradient from blue → pink → orange
   pointPalette: ['#6366f1', '#ec4899', '#f97316']
 };
+
+let glowIntensity = 1.0;
+let glowColor = null;
+
+
+window.getGlowDebug = () => ({ glowIntensity, glowColor });
+console.log('explorer.js loaded, debug hook ready');
+
+
+function updateGlowAppearance() {
+  if (!glowPoints) return;
+
+  // Hide the whole playhead when intensity is ~0
+  glowPoints.visible = glowIntensity > 0.01;
+
+  const core = glowPoints.getObjectByName('core');
+  const halo = glowPoints.getObjectByName('halo');
+
+  // Pick a color: user-set or neutral white
+  const color = glowColor ? new THREE.Color(glowColor) : new THREE.Color(1, 1, 1);
+
+  if (core) {
+    core.material.color.copy(color);
+    core.material.transparent = glowIntensity < 1.0;
+    core.material.opacity = glowIntensity; // 0 → invisible, 1 → full
+    core.material.needsUpdate = true;
+  }
+
+  if (halo) {
+    halo.material.color.copy(color);
+    halo.material.transparent = true;
+    halo.material.opacity = 0.35 * glowIntensity; // softer halo
+    halo.material.needsUpdate = true;
+  }
+}
+
+
 
 function getPointColorFromPalette(t) {
   const palette = theme.pointPalette;
@@ -91,6 +129,8 @@ function applyThemeToScene() {
     colorsAttr.needsUpdate = true;
     baseColors = new Float32Array(colors);
   }
+
+  updateGlowAppearance();
 }
 
 // Public API: user can call this from outside
@@ -100,6 +140,12 @@ function setUserTheme(options) {
   }
   if (Array.isArray(options.pointPalette) && options.pointPalette.length > 0) {
     theme.pointPalette = options.pointPalette;
+  }
+  if (typeof options.glowIntensity === 'number') {
+    glowIntensity = Math.max(0, Math.min(1, options.glowIntensity));
+  }
+  if (typeof options.glowColor === 'string') {
+    glowColor = options.glowColor; // e.g. '#000000'
   }
   applyThemeToScene();
 }
@@ -142,7 +188,35 @@ const idleAlphaSlider = document.getElementById('idle-alpha-slider');
 const idleAlphaValue  = document.getElementById('idle-alpha-value');
 const decaySlider     = document.getElementById('decay-slider');
 const decayValue      = document.getElementById('decay-value');
+const pathAlphaSlider = document.getElementById('path-alpha-slider');
+const pathAlphaValue  = document.getElementById('path-alpha-value');
+const glowSlider      = document.getElementById('glow-slider');
+const glowValue       = document.getElementById('glow-value');
+const glowColorInput  = document.getElementById('glow-color-input');
 
+if (glowSlider && glowValue) {
+  glowSlider.addEventListener('input', () => {
+    glowIntensity = parseInt(glowSlider.value, 10) / 100;
+    glowValue.textContent = glowIntensity.toFixed(2);
+    updateGlowAppearance();
+  });
+}
+
+if (glowColorInput) {
+  glowColorInput.addEventListener('input', () => {
+    glowColor = glowColorInput.value;
+    // If glow already exists, force one immediate update
+    if (glowPoints) {
+      const core = glowPoints.getObjectByName('core');
+      const halo = glowPoints.getObjectByName('halo');
+      if (core) core.material.color.set(glowColor);
+      if (halo) {
+        halo.material.color.set(glowColor);
+        halo.material.needsUpdate = true;
+      }
+    }
+  });
+}
 
 if (stylingBtn && paletteEditor) {
   stylingBtn.addEventListener('click', () => {
@@ -189,6 +263,22 @@ if (decaySlider && decayValue) {
     trailDecay = parseInt(decaySlider.value, 10);
     decayValue.textContent = trailDecay.toString();
     // No immediate geometry update needed; it will affect next playback frames
+  });
+}
+
+if (pathAlphaSlider && pathAlphaValue) {
+  // initialise displayed value from default
+  pathAlphaValue.textContent = pathIdleAlpha.toFixed(2);
+
+  pathAlphaSlider.addEventListener('input', () => {
+    pathIdleAlpha = parseInt(pathAlphaSlider.value, 10) / 100;
+    pathAlphaValue.textContent = pathIdleAlpha.toFixed(2);
+
+    // immediately apply to the connection path if it exists
+    if (connectionLines && connectionLines.material) {
+      connectionLines.material.opacity = pathIdleAlpha;
+      connectionLines.material.needsUpdate = true;
+    }
   });
 }
 
@@ -714,13 +804,15 @@ function buildClusters() {
       transparent: true,
       opacity: 0.35,
       blending: THREE.AdditiveBlending,
-      depthWrite: false
+      depthWrite: false,
+        depthTest: false
     });
 
     const sprite = new THREE.Sprite(mat);
     sprite.position.set(center[0], center[1], center[2]);
     sprite.scale.set(spriteSize, spriteSize, 1);
     sprite.userData = { baseOpacity: 0.35, clusterIdx: k };
+    sprite.renderOrder = 2;
     scene.add(sprite);
     clusterMeshes.push(sprite);
   }
@@ -1003,7 +1095,7 @@ function updatePlaybackVisualization() {
       // 0 at current point, 1 at end of trail (or beyond)
       const t = Math.min(dist / trailLength, 1.0);
       const glow = 1.0 - t;       // 1 → current, 0 → far past
-      const glowSq = glow * glow; // smoother falloff
+      const glowSq = glow * glow * glowIntensity; // smoother falloff
 
       // color glow
       colors[i * 3]     = baseColors[i * 3]     + (1 - baseColors[i * 3])     * glowSq;
@@ -1022,7 +1114,7 @@ function updatePlaybackVisualization() {
 
 
     // Trail line
-    const trailLineLength = 25;
+    const trailLineLength = Math.max(1, trailDecay);
     const trailStart = Math.max(0, latentIdx - trailLineLength);
 
     if (!trailLine && projection.length > 1) {
@@ -1078,27 +1170,54 @@ function updatePlaybackVisualization() {
             glowPoints = new THREE.Group();
 
             const coreGeom = new THREE.SphereGeometry(0.08, 16, 16);
-            const coreMat = new THREE.MeshBasicMaterial({color: 0xffffff});
+            const coreMat = new THREE.MeshBasicMaterial({
+                color: glowColor,
+                transparent: true,
+                opacity: glowIntensity
+            });
             const core = new THREE.Mesh(coreGeom, coreMat);
             core.name = 'core';
             glowPoints.add(core);
 
             const haloGeom = new THREE.SphereGeometry(0.18, 16, 16);
-            const haloMat = new THREE.MeshBasicMaterial({color: 0xffffff, transparent: true, opacity: 0.35});
+            const haloMat = new THREE.MeshBasicMaterial({
+                color: glowColor,
+                transparent: true,
+                opacity: 0.35 * glowIntensity
+            });
             const halo = new THREE.Mesh(haloGeom, haloMat);
             halo.name = 'halo';
             glowPoints.add(halo);
 
             scene.add(glowPoints);
         }
+
         glowPoints.position.set(x, y, z);
 
         const t = latentIdx / projection.length;
         const core = glowPoints.getObjectByName('core');
         const halo = glowPoints.getObjectByName('halo');
-        if (core) core.material.color.setHSL(t, 0.9, 0.85);
-        if (halo) halo.material.color.setHSL(t, 0.9, 0.6);
+
+        if (core) {
+            if (glowColor) {
+                core.material.color.set(glowColor);
+            } else {
+                core.material.color.setHSL(t, 0.9, 0.85);
+            }
+        }
+
+        if (halo) {
+            if (glowColor) {
+                halo.material.color.set(glowColor);
+            } else {
+                halo.material.color.setHSL(t, 0.9, 0.6);
+            }
+        }
+
+        // Apply current intensity to core + halo (visibility + opacity)
+        updateGlowAppearance();
     }
+
 
     // Clusters
     if (clusterAssignments.length > 0 && latentIdx < clusterAssignments.length) {
@@ -1214,7 +1333,7 @@ function initThreeJS() {
     }
     const lineGeom = new THREE.BufferGeometry();
     lineGeom.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
-    const lineMat = new THREE.LineBasicMaterial({ color: 0x333344, transparent: true, opacity: 0.3 });
+    const lineMat = new THREE.LineBasicMaterial({ color: 0x333344, transparent: true, opacity: pathIdleAlpha });
     connectionLines = new THREE.LineSegments(lineGeom, lineMat);
     scene.add(connectionLines);
 
