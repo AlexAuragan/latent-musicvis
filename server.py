@@ -24,12 +24,12 @@ import io
 import json
 import hashlib
 from typing import Optional, Dict
-import umap
+
 import tempfile
 import yt_dlp
 
-from back import vae, device, VAE_CONFIG_PATH, VAE_CKPT_PATH, SAMPLE_RATE, load_vae, encode_audio_chunked, unload_vae, \
-    MAX_CACHE_ENTRIES, SAMPLES_PER_LATENT, decode_audio_chunked, find_best_offset
+from back import device, VAE_CONFIG_PATH, VAE_CKPT_PATH, SAMPLE_RATE, load_vae, encode_audio_chunked, unload_vae, \
+    MAX_CACHE_ENTRIES, SAMPLES_PER_LATENT, decode_audio_chunked, project, vectorize
 
 # Store original waveform for playback
 current_waveform: Optional[torch.Tensor] = None
@@ -130,7 +130,7 @@ async def play_endpoint(request: PlayRequest):
 
 async def encode_from_bytes(content: bytes):
     """Shared SSE encoder: takes raw audio bytes, streams progress."""
-    global current_latents, current_projection, current_waveform, vae, latent_cache
+    global current_latents, current_projection, current_waveform, latent_cache
 
     file_hash = hashlib.md5(content).hexdigest()
 
@@ -166,18 +166,6 @@ async def encode_from_bytes(content: bytes):
         audio_buffer = io.BytesIO(content)
         waveform, sr = torchaudio.load(audio_buffer)
 
-        if sr != SAMPLE_RATE:
-            resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
-            waveform = resampler(waveform)
-
-        if waveform.shape[0] == 1:
-            waveform = torch.cat([waveform, waveform], dim=0)
-        elif waveform.shape[0] > 2:
-            waveform = waveform[:2]
-
-        waveform = waveform / (waveform.abs().max() + 1e-6)
-        current_waveform = waveform
-
         yield f"data: {json.dumps({'stage': 'loading_vae'})}\n\n"
 
         if vae is None:
@@ -185,13 +173,9 @@ async def encode_from_bytes(content: bytes):
 
         yield f"data: {json.dumps({'stage': 'encoding'})}\n\n"
 
-        print("finding")
-        offset = find_best_offset(waveform)
-
-        padded_waveform = torch.nn.functional.pad(waveform, (offset, 0))
-        latents = encode_audio_chunked(padded_waveform, chunk_seconds=10.0)
-        latents_np = latents[0].cpu().numpy().T
+        waveform, latents_np = vectorize(waveform, sr)
         current_latents = latents_np
+        current_waveform = waveform
 
         print(f"Encoded {waveform.shape[1]} samples -> {latents_np.shape[0]} latents")
 
@@ -200,28 +184,7 @@ async def encode_from_bytes(content: bytes):
 
         yield f"data: {json.dumps({'stage': 'umap', 'num_latents': int(latents_np.shape[0])})}\n\n"
 
-        # UMAP
-        if latents_np.shape[0] < 5:
-            projection = latents_np[:, :3]
-        else:
-            n_pts = latents_np.shape[0]
-            reducer = umap.UMAP(
-                n_components=3,
-                n_neighbors=min(50, n_pts - 1),
-                min_dist=0.3,
-                n_epochs=1000,
-                metric="euclidean",
-                spread=1.0,
-                random_state=42,
-            )
-            projection = reducer.fit_transform(latents_np)
-
-        # Normalize projection
-        proj_mean = projection.mean(axis=0)
-        proj_centered = projection - proj_mean
-        proj_max = np.abs(proj_centered).max(axis=0) + 1e-6  # per-dimension max
-        projection_normalized = proj_centered / proj_max
-
+        projection_normalized = project(latents_np)
         current_projection = projection_normalized
 
         # Cache
@@ -293,6 +256,7 @@ async def resynth(file: UploadFile = File(...)):
 
         target_latents = encode_audio_chunked(waveform, chunk_seconds=10.0)
         target_np = target_latents[0].cpu().numpy().T
+
 
         print(
             f"Resynth: {target_np.shape[0]} target latents, {current_latents.shape[0]} codebook latents"

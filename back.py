@@ -14,6 +14,9 @@ import json
 import gc
 from typing import Optional, Dict
 
+import torchaudio
+import umap
+from torch import Tensor
 
 # ============ CONFIG ============
 VAE_CONFIG_PATH = os.environ.get("VAE_CONFIG_PATH", "stable_audio_2_0_vae.json")
@@ -256,3 +259,44 @@ def decode_audio_chunked(
         torch.cuda.empty_cache()
 
     return torch.cat(chunks, dim=2)
+
+def vectorize(waveform: Tensor, sr: int):
+    if sr != SAMPLE_RATE:
+        resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
+        waveform = resampler(waveform)
+
+    if waveform.shape[0] == 1:
+        waveform = torch.cat([waveform, waveform], dim=0)
+    elif waveform.shape[0] > 2:
+        waveform = waveform[:2]
+
+    waveform = waveform / (waveform.abs().max() + 1e-6)
+
+    offset = find_best_offset(waveform)
+
+    padded_waveform = torch.nn.functional.pad(waveform, (offset, 0))
+    latents = encode_audio_chunked(padded_waveform, chunk_seconds=10.0)
+    return waveform, latents[0].cpu().numpy().T
+
+def project(latents_np: np.ndarray):
+    # UMAP
+    if latents_np.shape[0] < 5:
+        projection = latents_np[:, :3]
+    else:
+        n_pts = latents_np.shape[0]
+        reducer = umap.UMAP(
+            n_components=3,
+            n_neighbors=min(50, n_pts - 1),
+            min_dist=0.3,
+            n_epochs=1000,
+            metric="euclidean",
+            spread=1.0,
+            random_state=42,
+        )
+        projection = reducer.fit_transform(latents_np)
+
+    # Normalize projection
+    proj_mean = projection.mean(axis=0)
+    proj_centered = projection - proj_mean
+    proj_max = np.abs(proj_centered).max(axis=0) + 1e-6  # per-dimension max
+    return proj_centered / proj_max
