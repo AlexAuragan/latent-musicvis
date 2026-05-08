@@ -29,7 +29,7 @@ import tempfile
 import yt_dlp
 
 from back import device, VAE_CONFIG_PATH, VAE_CKPT_PATH, SAMPLE_RATE, load_vae, encode_audio_chunked, unload_vae, \
-    MAX_CACHE_ENTRIES, SAMPLES_PER_LATENT, decode_audio_chunked, project, vectorize
+    MAX_CACHE_ENTRIES, SAMPLES_PER_LATENT, decode_audio_chunked, project, vectorize, replace_silence_projection
 
 # Store original waveform for playback
 current_waveform: Optional[torch.Tensor] = None
@@ -168,12 +168,11 @@ async def encode_from_bytes(content: bytes):
 
         yield f"data: {json.dumps({'stage': 'loading_vae'})}\n\n"
 
-        if vae is None:
-            load_vae()
+        load_vae()
 
         yield f"data: {json.dumps({'stage': 'encoding'})}\n\n"
 
-        waveform, latents_np = vectorize(waveform, sr)
+        waveform, latents_np, silence_mask = vectorize(waveform, sr)
         current_latents = latents_np
         current_waveform = waveform
 
@@ -184,7 +183,7 @@ async def encode_from_bytes(content: bytes):
 
         yield f"data: {json.dumps({'stage': 'umap', 'num_latents': int(latents_np.shape[0])})}\n\n"
 
-        projection_normalized = project(latents_np)
+        projection_normalized = project(latents_np, silence_mask)
         current_projection = projection_normalized
 
         # Cache
@@ -302,6 +301,7 @@ async def resynth(file: UploadFile = File(...)):
 
 @app.get("/health")
 async def health():
+    from back import vae
     return {
         "status": "ok",
         "vae_loaded": vae is not None,
@@ -318,6 +318,8 @@ def download_youtube_audio(url: str) -> Path:
     Download audio from YouTube using yt-dlp into CACHE_DIR.
     Returns the path to the audio file.
     """
+    if "playlist?" in url:
+        raise ValueError("The link provided is a playlist, please provide a link to a single video.")
     if not url.strip():
         raise HTTPException(status_code=400, detail="Empty URL")
 

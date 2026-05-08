@@ -89,6 +89,22 @@ Result: target's structure + source's timbre.
 - **Frontend**: Vanilla JS, Three.js (via CDN)
 - **No build step** - just run the server
 
+## Optimize sont length
+ But du jeu > Accéléré ou ralentir la musique pour que son BPM match l'une des valeurs suivantes:
+ Dans ce cas, la découpe sera optimale 
+1. Détection de beat > c'est pas fiable à 100% donc à voir. Peut-être fait à la main.
+2. Détection de la phase / de l'offset, qui doit se faire après la détection du beat.
+
+| nb découpe | bpm  |
+|---|---|
+| 8          |161.5 |
+| 9          |143.56|
+| 10         |129.2 |
+| 11         |117.45|
+| 12         |107.7 |
+| 13         |117.45|
+| 14         |92.28 |
+| 15         |86.13 |
 ## License
 
 MIT

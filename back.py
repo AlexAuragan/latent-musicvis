@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import json
 import gc
-from typing import Optional, Dict
 
 import torchaudio
 import umap
@@ -25,7 +24,31 @@ VAE_CKPT_PATH = os.environ.get("VAE_CKPT_PATH", "sao_vae_tune_100k_unwrapped.ckp
 SAMPLE_RATE = 44100
 SAMPLES_PER_LATENT = 2048
 LATENT_DIM = 64
+# nb point * sample_per_latent / sample_rate = durées en s.
+# 1292 bpm = 4 * 17 * 19  < bpm de notre découpe
+# On veut que notre _découpe_ soit en rythme avec la musique ou l'inverse
+# En rythme veut dire que dans un beat, il y a un nombre *entier* de découpe
+# On cherche k entier tq k * bpm music = bpm découpe
 
+# Si une musique est à 120 bpm, combien de découpe par beat ?
+# Actuellement, on a 1292/120 = 10.77 découpe par beat. On veut que ce soit rond
+# Round le plus proche c'est 11 découpe par beat, donc on fait 1292 / 11 = 117.45bpm < le beat optimal pour une musique à 120 bpm
+
+
+# But du jeu > Accéléré ou ralentir la musique pour que son BPM match l'une des valeurs suivantes:
+# Dans ce cas, la découpe sera optimale
+# +------------+------+
+# | nb découpe | bpm  |
+# +------------+------+
+# | 8          |161.5 |
+# | 9          |143.56|
+# | 10         |129.2 |
+# | 11         |117.45|
+# | 12         |107.7 |
+# | 13         |117.45|
+# | 14         |92.28 |
+# | 15         |86.13 |
+# +------------+------+
 # Global VAE model
 vae = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -73,6 +96,8 @@ def find_best_offset(waveform: torch.Tensor, max_offset: int = SAMPLES_PER_LATEN
 def load_vae():
     """Load the VAE model from configured paths"""
     global vae
+    if vae is not None:
+        return
 
     try:
         from stable_audio_tools.models.factory import create_model_from_config
@@ -260,6 +285,66 @@ def decode_audio_chunked(
 
     return torch.cat(chunks, dim=2)
 
+
+def detect_silence_frames(
+        waveform: torch.Tensor,
+        threshold_db: float = -40.0,
+        frame_size: int = SAMPLES_PER_LATENT
+) -> torch.Tensor:
+    """
+    Detect which frames are silence.
+    Returns: boolean tensor of shape [num_frames] where True = silence
+    """
+    if waveform.dim() == 2:
+        waveform = waveform.unsqueeze(0)
+
+    batch, channels, total_samples = waveform.shape
+
+    # Align to frame boundaries
+    num_frames = total_samples // frame_size
+    usable_samples = num_frames * frame_size
+    waveform = waveform[:, :, :usable_samples]
+
+    # Reshape into frames: [batch, channels, num_frames, frame_size]
+    frames = waveform.view(batch, channels, num_frames, frame_size)
+
+    # Calculate RMS energy per frame in dB
+    frame_energy = frames.pow(2).mean(dim=(1, 3))  # [batch, num_frames]
+    frame_db = 20 * torch.log10(frame_energy.sqrt() + 1e-10)
+
+    # Detect silent frames
+    is_silent = frame_db <= threshold_db  # [batch, num_frames]
+
+    return is_silent.squeeze(0)  # Remove batch dimension
+
+
+def replace_silence_projection(
+        projection: np.ndarray,
+        silence_mask: torch.Tensor
+) -> np.ndarray:
+    """Replace silence in 3D projection space"""
+    non_silent_indices = torch.where(~silence_mask)[0]
+
+    if len(non_silent_indices) == 0:
+        return projection
+
+    first_musical = non_silent_indices[0].item()
+    last_musical = non_silent_indices[-1].item()
+
+    result = projection.copy()
+
+    # Replace leading silence
+    if first_musical > 0:
+        result[:first_musical] = projection[first_musical]
+
+    # Replace trailing silence
+    if last_musical < len(projection) - 1:
+        result[last_musical + 1:] = projection[last_musical]
+
+    return result
+
+    return result
+
 def vectorize(waveform: Tensor, sr: int):
     if sr != SAMPLE_RATE:
         resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
@@ -270,15 +355,17 @@ def vectorize(waveform: Tensor, sr: int):
     elif waveform.shape[0] > 2:
         waveform = waveform[:2]
 
-    waveform = waveform / (waveform.abs().max() + 1e-6)
 
     offset = find_best_offset(waveform)
+    waveform = torch.nn.functional.pad(waveform, (offset, 0))
+    # waveform = waveform / (waveform.abs().max() + 1e-6)
 
-    padded_waveform = torch.nn.functional.pad(waveform, (offset, 0))
-    latents = encode_audio_chunked(padded_waveform, chunk_seconds=10.0)
-    return waveform, latents[0].cpu().numpy().T
+    latents = encode_audio_chunked(waveform, chunk_seconds=10.0)
+    silence_mask = detect_silence_frames(waveform, threshold_db=-40)
+    return waveform, latents[0].cpu().numpy().T, silence_mask
 
-def project(latents_np: np.ndarray):
+
+def project(latents_np: np.ndarray, silence_mask: torch.Tensor = None):
     # UMAP
     if latents_np.shape[0] < 5:
         projection = latents_np[:, :3]
@@ -292,11 +379,14 @@ def project(latents_np: np.ndarray):
             metric="euclidean",
             spread=1.0,
             random_state=42,
+            repulsion_strength=1
         )
         projection = reducer.fit_transform(latents_np)
-
+    if silence_mask is not None:
+        projection = replace_silence_projection(projection, silence_mask)
     # Normalize projection
     proj_mean = projection.mean(axis=0)
     proj_centered = projection - proj_mean
     proj_max = np.abs(proj_centered).max(axis=0) + 1e-6  # per-dimension max
-    return proj_centered / proj_max
+    projection = proj_centered / proj_max
+    return projection
